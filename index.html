@@ -200,4 +200,262 @@ $('saveCommitment').onclick=()=>{state.commitment=$('commitment').value.trim();p
 $('exportBtn').onclick=()=>{let blob=new Blob([JSON.stringify(state,null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='proyecto-halcon-backup.json';a.click();URL.revokeObjectURL(a.href);notify('Copia JSON exportada')};
 $('importBtn').onclick=()=>$('importFile').click();$('importFile').onchange=async e=>{let f=e.target.files[0];if(!f)return;try{let d=JSON.parse(await f.text());if(!Array.isArray(d.runs))throw Error();state={...defaults,...d,checks:d.checks||{},runs:d.runs};persist();render();notify('Datos importados')}catch(err){notify('Archivo JSON no válido')}e.target.value=''};
 $('date').value=today();$('date').onchange=()=>{};window.addEventListener('resize',()=>renderCharts(sortedRuns()));loadGuide();renderWarm();render();
+
+/* PROYECTO HALCON: autenticacion y sincronizacion */
+(function () {
+  const SUPABASE_URL = "https://mqeugcibtujaiiikkiah.supabase.co";
+  const SUPABASE_KEY = "sb_publishable_hKrYLiKhLJDyYTvH9WOP0g_bw1A8A4J";
+
+  let client = null;
+  let currentUser = null;
+  let syncReady = false;
+  let syncTimer = null;
+  let loadingUserId = null;
+
+  const originalPersist = persist;
+
+  // Mantener el guardado local y sincronizar cuando haya sesion.
+  persist = function () {
+    originalPersist();
+    if (syncReady && currentUser) scheduleSync();
+  };
+
+  const style = document.createElement("style");
+  style.textContent = `
+    #halconCloud {
+      margin: 16px auto;
+      padding: 18px;
+      max-width: 680px;
+      border: 1px solid #d5dce5;
+      border-radius: 16px;
+      background: #fff;
+      color: #172033;
+      font: 14px/1.5 system-ui, sans-serif;
+      box-sizing: border-box;
+    }
+    #halconCloud * { box-sizing: border-box; }
+    #halconCloud input, #halconCloud button {
+      width: 100%; padding: 11px; margin-top: 8px;
+      border-radius: 9px; font: inherit;
+    }
+    #halconCloud input { border: 1px solid #cbd5e1; }
+    #halconCloud button {
+      border: 0; cursor: pointer; background: #176b4d;
+      color: white; font-weight: 650;
+    }
+    #halconCloud button.secondary {
+      background: #e8edf2; color: #172033;
+    }
+    #halconCloudStatus {
+      margin-top: 12px; overflow-wrap: anywhere;
+    }
+    #halconCloud .cloud-note {
+      color: #526071; font-size: 12px; margin-top: 8px;
+    }
+  `;
+  document.head.appendChild(style);
+
+  const panel = document.createElement("section");
+  panel.id = "halconCloud";
+  panel.innerHTML = `
+    <h3 style="margin:0 0 6px">☁️ Proyecto Halcón — Mi cuenta</h3>
+    <p style="margin:0 0 12px">
+      Inicia sesión para sincronizar tus entrenamientos.
+    </p>
+    <label for="halconEmail">Correo electrónico</label>
+    <input id="halconEmail" type="email"
+      autocomplete="email" placeholder="tu@correo.com" required>
+    <label for="halconPassword">Contraseña</label>
+    <input id="halconPassword" type="password"
+      autocomplete="current-password" placeholder="Mínimo 6 caracteres" required>
+    <button id="halconLogin">Iniciar sesión</button>
+    <button id="halconRegister" class="secondary">
+      Crear mi cuenta
+    </button>
+    <button id="halconLogout" class="secondary" hidden>
+      Cerrar sesión
+    </button>
+    <div id="halconCloudStatus" role="status" aria-live="polite">
+      Preparando conexión segura…
+    </div>
+    <p class="cloud-note">
+      Tus datos locales se conservan. La sincronización requiere iniciar
+      sesión y conexión a internet.
+    </p>
+  `;
+
+  document.body.prepend(panel);
+
+  const $cloud = (id) => document.getElementById(id);
+  const status = (message) => {
+    $cloud("halconCloudStatus").textContent = message;
+  };
+
+  function scheduleSync() {
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(syncNow, 900);
+  }
+
+  async function syncNow() {
+    if (!client || !currentUser || !syncReady) return;
+
+    const snapshot = JSON.parse(JSON.stringify(state));
+    const { error } = await client
+      .from("running_app_state")
+      .upsert({
+        user_id: currentUser.id,
+        app_state: snapshot,
+        updated_at: new Date().toISOString()
+      }, { onConflict: "user_id" });
+
+    if (error) {
+      status("No se pudo sincronizar. Tus datos locales siguen guardados. " +
+        error.message);
+      return;
+    }
+
+    status("☁️ Entrenamientos sincronizados correctamente.");
+  }
+
+  async function activateUser(user) {
+    if (!user || loadingUserId === user.id) return;
+    loadingUserId = user.id;
+    syncReady = false;
+    currentUser = user;
+    $cloud("halconLogout").hidden = false;
+    $cloud("halconLogin").disabled = true;
+    $cloud("halconRegister").disabled = true;
+    status("Buscando tus datos guardados en la nube…");
+
+    try {
+      const { data, error } = await client
+        .from("running_app_state")
+        .select("app_state")
+        .eq("user_id", user.id)
+        .maybeSingle();
+
+      if (error) throw error;
+
+      if (data && data.app_state) {
+        // La copia local ya se exportó antes de comenzar.
+        state = {
+          ...defaults,
+          ...data.app_state,
+          checks: data.app_state.checks || {},
+          runs: Array.isArray(data.app_state.runs)
+            ? data.app_state.runs : []
+        };
+
+        originalPersist();
+        render();
+        syncReady = true;
+        status("Datos de tu cuenta cargados en este dispositivo.");
+      } else {
+        // Primera sincronización: conservar y subir los datos locales.
+        syncReady = true;
+        await syncNow();
+      }
+    } catch (error) {
+      syncReady = false;
+      status("No se pudo cargar la nube. Los datos locales se conservan. " +
+        error.message);
+    } finally {
+      loadingUserId = null;
+      $cloud("halconLogin").disabled = false;
+      $cloud("halconRegister").disabled = false;
+    }
+  }
+
+  async function startCloud() {
+    if (!window.supabase) {
+      status("No se pudo cargar la biblioteca de conexión. " +
+        "Comprueba internet y recarga la página.");
+      return;
+    }
+
+    client = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+    client.auth.onAuthStateChange((event, session) => {
+      if (event === "SIGNED_OUT") {
+        currentUser = null;
+        syncReady = false;
+        clearTimeout(syncTimer);
+        $cloud("halconLogout").hidden = true;
+        status("Sesión cerrada. Tus datos locales siguen disponibles.");
+      } else if (session && session.user) {
+        setTimeout(() => activateUser(session.user), 0);
+      }
+    });
+
+    const { data, error } = await client.auth.getSession();
+    if (error) {
+      status("No se pudo comprobar la sesión: " + error.message);
+      return;
+    }
+
+    if (data.session) {
+      await activateUser(data.session.user);
+    } else {
+      status("Conexión preparada. Inicia sesión o crea tu cuenta.");
+    }
+  }
+
+  $cloud("halconLogin").addEventListener("click", async () => {
+    const email = $cloud("halconEmail").value.trim();
+    const password = $cloud("halconPassword").value;
+    if (!email || !password) {
+      status("Escribe tu correo y contraseña.");
+      return;
+    }
+
+    const { error } = await client.auth.signInWithPassword({
+      email, password
+    });
+
+    if (error) status("No se pudo iniciar sesión: " + error.message);
+  });
+
+  $cloud("halconRegister").addEventListener("click", async () => {
+    const email = $cloud("halconEmail").value.trim();
+    const password = $cloud("halconPassword").value;
+    if (!email || !password) {
+      status("Escribe tu correo y una contraseña.");
+      return;
+    }
+    if (password.length < 6) {
+      status("Usa una contraseña de al menos 6 caracteres.");
+      return;
+    }
+
+    const { data, error } = await client.auth.signUp({
+      email, password
+    });
+
+    if (error) {
+      status("No se pudo crear la cuenta: " + error.message);
+    } else if (!data.session) {
+      status("Cuenta creada. Revisa tu correo para confirmar el registro; " +
+  "después inicia sesión aquí.");
+    } else {
+      status("Cuenta creada. Preparando tus datos…");
+    }
+  });
+
+  $cloud("halconLogout").addEventListener("click", async () => {
+    if (!client) return;
+    const { error } = await client.auth.signOut();
+    if (error) status("No se pudo cerrar sesión: " + error.message);
+  });
+
+  // Cargar la biblioteca oficial de Supabase JS v2.
+  const library = document.createElement("script");
+  library.src = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2";
+  library.onload = startCloud;
+  library.onerror = () => status(
+    "No se pudo descargar Supabase JS. Comprueba tu conexión a internet."
+  );
+  document.head.appendChild(library);
+})();
+
 </script></body></html>
+
